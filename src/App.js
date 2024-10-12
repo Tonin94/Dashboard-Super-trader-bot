@@ -5,36 +5,42 @@ const App = () => {
   const [data, setData] = useState([]);
   const [currentCandle, setCurrentCandle] = useState(null);
   const [streamSessionId, setStreamSessionId] = useState(null);
+  const [askData, setAskData] = useState([]);
+  const [bidData, setBidData] = useState([]);
+  const [averageData, setAverageData] = useState([]);
   const demoWebSocketRef = useRef(null);
   const streamWebSocketRef = useRef(null);
+  const lastTimestampRef = useRef(null); // Aggiunto per tracciare l'ultimo timestamp
 
+  // Intervallo per inviare ping e mantenere viva la connessione
   useEffect(() => {
-    const pingInterval = setInterval(() => {
-      if (streamWebSocketRef.current && streamWebSocketRef.current.readyState === WebSocket.OPEN) {
-        const pingMessage = {
-          command: 'ping',
-          streamSessionId: streamSessionId,
-        };
-        streamWebSocketRef.current.send(JSON.stringify(pingMessage));
-        console.log('Ping inviato per mantenere la connessione attiva');
-      }
-    }, 300000);
+    let pingInterval;
 
-    return () => clearInterval(pingInterval);
-  }, [streamSessionId]);
+    if (demoWebSocketRef.current && demoWebSocketRef.current.readyState === WebSocket.OPEN) {
+      pingInterval = setInterval(() => {
+        if (demoWebSocketRef.current && demoWebSocketRef.current.readyState === WebSocket.OPEN) {
+          const pingMessage = {
+            command: 'ping',
+          };
+          demoWebSocketRef.current.send(JSON.stringify(pingMessage));
+          console.log('Ping inviato sulla connessione principale per mantenerla attiva');
+        }
+      }, 30000); // ogni 30 secondi
+    }
 
+    return () => {
+      if (pingInterval) clearInterval(pingInterval);
+    };
+  }, [demoWebSocketRef.current]);
 
+  // Aggiorna l'array dei dati con la candela corrente
   useEffect(() => {
-    const interval = setInterval(() => {
-      if (currentCandle) {
-        setData((prevData) => [...prevData, currentCandle]);
-        setCurrentCandle(null); 
-      }
-    }, 60000); 
-
-    return () => clearInterval(interval);
+    if (currentCandle) {
+      setData((prevData) => [...prevData, currentCandle]);
+    }
   }, [currentCandle]);
 
+  // Stabilisce la connessione WebSocket iniziale per l'autenticazione
   useEffect(() => {
     if (!demoWebSocketRef.current) {
       const ws = new WebSocket('wss://ws.xtb.com/demo');
@@ -49,7 +55,7 @@ const App = () => {
 
       ws.onopen = () => {
         ws.send(JSON.stringify(loginMessage));
-        console.log('Autenticazione inviata');
+        console.log('Richiesta di login inviata');
       };
 
       ws.onmessage = (event) => {
@@ -57,13 +63,16 @@ const App = () => {
         console.log('Autenticato:', response);
 
         if (response.status && response.streamSessionId) {
-          setStreamSessionId(response.streamSessionId); 
+          setStreamSessionId(response.streamSessionId);
+        } else if (response.status === false && response.errorCode) {
+          console.error(`Errore dal server: ${response.errorCode} - ${response.errorDescr}`);
         }
       };
 
       ws.onerror = (error) => {
         console.error('Errore WebSocket:', error);
       };
+
       demoWebSocketRef.current = ws;
     }
 
@@ -74,108 +83,162 @@ const App = () => {
     };
   }, []);
 
+  // Stabilisce la connessione WebSocket per lo streaming e gestisce le riconnessioni
+  useEffect(() => {
+    const maxReconnectAttempts = 5;
+    let reconnectAttempts = 0;
 
- useEffect(() => {
-  let reconnectAttempts = 0;
-  const maxReconnectAttempts = 5;
+    const connectWebSocket = () => {
+      if (streamSessionId) {
+        if (streamWebSocketRef.current) {
+          streamWebSocketRef.current.close();
+        }
 
-  const connectWebSocket = () => {
-    if (streamSessionId && !streamWebSocketRef.current) {
-      const streamWS = new WebSocket('wss://ws.xtb.com/demoStream');
+        const streamWS = new WebSocket('wss://ws.xtb.com/demoStream');
 
-      streamWS.onopen = () => {
-        console.log('Connessione allo stream aperta');
+        streamWS.onopen = () => {
+          console.log('Connessione allo stream aperta');
 
-        const subscribeMessage = {
-          command: 'getTickPrices',
-          streamSessionId: streamSessionId,
-          symbol: 'EURUSD',
-          minArrivalTime: 200,
+          const subscribeMessage = {
+            command: 'getTickPrices',
+            streamSessionId: streamSessionId,
+            symbol: 'BITCOIN',
+            minArrivalTime: 200,
+            maxLevel: 0,
+          };
+
+          streamWS.send(JSON.stringify(subscribeMessage));
+          console.log('Richiesta di abbonamento inviata:', subscribeMessage);
+          reconnectAttempts = 0;
         };
 
-        streamWS.send(JSON.stringify(subscribeMessage));
-        console.log('Richiesta di abbonamento inviata:', subscribeMessage);
-        reconnectAttempts = 0;
-      };
+        streamWS.onmessage = (event) => {
+          console.log('Messaggio ricevuto dallo stream', event.data);
 
-      streamWS.addEventListener("message", (event) => {
-        console.log("Messaggio ricevuto dallo stream", event.data);
+          try {
+            const parsedResponse = JSON.parse(event.data);
+            console.log('Dati parsati:', parsedResponse);
 
-        try {
-          const parsedResponse = JSON.parse(event.data);
-          console.log("Dati parsati:", parsedResponse);
+            // Gestione dei messaggi ping dal server
+            if (parsedResponse.command === 'ping') {
+              const pongMessage = { command: 'pong', streamSessionId: streamSessionId };
+              streamWS.send(JSON.stringify(pongMessage));
+              console.log('Pong inviato in risposta al ping del server');
+              return;
+            }
 
-          if (parsedResponse.command === 'tickPrices' && parsedResponse.data && parsedResponse.data.level === 0) {
-            console.log("Dati tick ricevuti (livello 0):", parsedResponse.data);
+            if (
+                parsedResponse.command === 'tickPrices' &&
+                parsedResponse.data &&
+                parsedResponse.data.level === 0
+            ) {
+              console.log('Dati tick ricevuti (livello 0):', parsedResponse.data);
 
-            const timestamp = Math.floor(parsedResponse.data.timestamp / 1000); 
-            const price = parsedResponse.data.ask; 
+              const timestamp = Math.floor(parsedResponse.data.timestamp / 1000);
 
-            setCurrentCandle((prevCandle) => {
-              if (prevCandle) {
-                return {
-                  ...prevCandle,
-                  high: Math.max(prevCandle.high, price),
-                  low: Math.min(prevCandle.low, price),
-                  close: price, 
-                };
-              } else {
-                return {
+              // Controlla se il timestamp è diverso dall'ultimo
+              if (lastTimestampRef.current !== timestamp) {
+                lastTimestampRef.current = timestamp;
+
+                const askPrice = parsedResponse.data.ask;
+                const bidPrice = parsedResponse.data.bid;
+                const averagePrice = (askPrice + bidPrice) / 2;
+
+                // Aggiorna i dati per le linee
+                setAskData((prevData) => {
+                  const newData = [...prevData, { time: timestamp, value: askPrice }];
+                  return newData.slice(-1000);
+                });
+
+                setBidData((prevData) => {
+                  const newData = [...prevData, { time: timestamp, value: bidPrice }];
+                  return newData.slice(-1000);
+                });
+
+                setAverageData((prevData) => {
+                  const newData = [...prevData, { time: timestamp, value: averagePrice }];
+                  return newData.slice(-1000);
+                });
+
+                // Aggiorna la candela corrente
+                setCurrentCandle({
                   time: timestamp,
-                  open: price,
-                  high: price,
-                  low: price,
-                  close: price,
-                };
+                  open: askPrice,
+                  high: askPrice,
+                  low: askPrice,
+                  close: askPrice,
+                });
+              } else {
+                // Aggiorna la candela corrente esistente
+                const askPrice = parsedResponse.data.ask;
+                setCurrentCandle((prevCandle) => {
+                  if (prevCandle) {
+                    return {
+                      ...prevCandle,
+                      high: Math.max(prevCandle.high, askPrice),
+                      low: Math.min(prevCandle.low, askPrice),
+                      close: askPrice,
+                    };
+                  } else {
+                    return prevCandle;
+                  }
+                });
               }
-            });
-          } else {
-            console.log("Nessun dato di tick ricevuto o comando errato:", parsedResponse);
+            } else {
+              console.log('Nessun dato di tick ricevuto o comando errato:', parsedResponse);
+            }
+          } catch (error) {
+            console.error('Errore nella parsing della risposta:', error);
           }
-        } catch (error) {
-          console.error("Errore nella parsing della risposta:", error);
-        }
-      });
+        };
 
-      streamWS.onclose = (event) => {
-        console.log('Connessione chiusa:', event);
-        if (!event.wasClean) {
-          console.error('Connessione chiusa inaspettatamente:', event);
+        streamWS.onclose = (event) => {
+          console.log('Connessione allo stream chiusa:', event);
+          if (!event.wasClean) {
+            console.error('Chiusura inaspettata dello stream:', event);
 
-          if (reconnectAttempts < maxReconnectAttempts) {
-            reconnectAttempts += 1;
-            console.log(`Tentativo di riconnessione ${reconnectAttempts}...`);
-            setTimeout(() => {
-              connectWebSocket();
-            }, 1000 * reconnectAttempts);
+            if (reconnectAttempts < maxReconnectAttempts) {
+              reconnectAttempts += 1;
+              console.log(`Tentativo di riconnessione ${reconnectAttempts}...`);
+              setTimeout(() => {
+                connectWebSocket();
+              }, 1000 * reconnectAttempts);
+            } else {
+              console.error('Numero massimo di tentativi di riconnessione raggiunto');
+            }
           } else {
-            console.error('Numero massimo di tentativi di riconnessione raggiunto');
+            console.log('Connessione allo stream chiusa correttamente');
           }
-        }
-      };
+        };
 
-      streamWS.onerror = (error) => {
-        console.error("Errore WebSocket streaming:", error);
-      };
+        streamWS.onerror = (error) => {
+          console.error('Errore WebSocket streaming:', error);
+        };
 
-      streamWebSocketRef.current = streamWS;
-    }
-  };
+        streamWebSocketRef.current = streamWS;
+      }
+    };
 
-  connectWebSocket();
+    connectWebSocket();
 
-  return () => {
-    if (streamWebSocketRef.current && streamWebSocketRef.current.readyState === WebSocket.OPEN) {
-      streamWebSocketRef.current.close();
-    }
-  };
-}, [streamSessionId]);
+    return () => {
+      if (streamWebSocketRef.current) {
+        streamWebSocketRef.current.close();
+      }
+    };
+  }, [streamSessionId]);
 
   return (
-    <div>
-      <h1>Grafico Candlestick EUR/USD in Tempo Reale</h1>
-      <GraficCharts data={data} currentCandle={currentCandle} />
-    </div>
+      <div>
+        <h1>Grafico Candlestick EUR/USD in Tempo Reale</h1>
+        <GraficCharts
+            data={data}
+            currentCandle={currentCandle}
+            askData={askData}
+            bidData={bidData}
+            averageData={averageData}
+        />
+      </div>
   );
 };
 
